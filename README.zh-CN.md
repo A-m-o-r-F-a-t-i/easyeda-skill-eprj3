@@ -45,5 +45,5 @@ install/       不同代理的接入说明
 
 ## 来源与许可证
 
-本仓库基于 EasyEDA 的 MIT 许可项目进行 AgentDock 集成，固定来源提交为 `bffb417434c299d61e0ae4ed560991dc986a9850`。原许可证保存在 [LICENSE](LICENSE) 中；上游归属和第三方权利不因本仓库为私有仓库而改变。
+本仓库基于 EasyEDA 的 MIT 许可项目进行 AgentDock 集成，固定来源提交为 `bffb417434c299d61e0ae4ed560991dc986a9850`。原许可证保存在 [LICENSE](LICENSE) 中；上游归属和第三方权利不因本仓库为公开仓库而改变。
 
