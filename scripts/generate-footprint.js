@@ -1,0 +1,163 @@
+#!/usr/bin/env node
+'use strict';
+/**
+ * generate-footprint.js — build a FOOTPRINT doc and stage it as a TEMP
+ * library entry: <project>/.tmp/library/footprint/<name>.json (kind
+ * "footprint").
+ *
+ * Check the preset templates first (load-library.js list) — stage a custom
+ * footprint only when no preset fits. Entries named like a preset are
+ * rejected: placement resolves presets first, so a shadowing name could never
+ * be used. Place it on the PCB with add-footprint.js --footprint.
+ *
+ * Subcommand:
+ *   from-pads --dir <project> --name <lib-name> [--designator U]
+ *             [--description D] [--tags "a,b"] --pads "<spec>"
+ *             [--outline "R,x,y,w,h"] [--silk "<spec>"]
+ *
+ * All coordinates are mil (footprint docs carry them as-is despite the mm
+ * canvas unit — see the official example).
+ *   pads   spec: ';'-separated num:x:y:w:h[:holeD]
+ *          RECT pads on layer 1 (SMD); with a drill diameter holeD the pad
+ *          becomes through-hole: ELLIPSE pad + ROUND hole on layer 12 (MULTI)
+ *   outline spec: R,x,y,w,h                        (layer 48 component body)
+ *   silk   spec: ';'-separated items:
+ *                rect,x1,y1,x2,y2                  (closed rect outline)
+ *                path,x1,y1,x2,y2[,x3,y3,...]      (open polyline)
+ *                                                  (layer 3, width 6)
+ */
+const E = require('./lib/eprj3');
+const { parseArgs, printHelp, die } = require('./lib/utils');
+
+const SCHEMA = [
+  { name: 'dir', desc: 'project directory', required: true },
+  { name: 'name', desc: 'library entry name (must not shadow a preset)', required: true },
+  { name: 'designator', desc: 'designator prefix, e.g. R -> R?' },
+  { name: 'description', desc: 'footprint description' },
+  { name: 'tags', desc: 'comma-separated tags' },
+  { name: 'pads', desc: 'pad spec num:x:y:w:h[:holeDiameter];... (mil)', required: true },
+  { name: 'outline', desc: 'body outline R,x,y,w,h (mil, layer 48)' },
+  { name: 'silk', desc: 'silk spec, see above (mil, layer 3)' }
+];
+
+function parsePads(spec) {
+  return spec.split(';').map((s) => s.trim()).filter(Boolean).map((s) => {
+    const p = s.split(':');
+    if (p.length !== 5 && p.length !== 6) return die(`bad pad spec "${s}" (want num:x:y:w:h or num:x:y:w:h:holeDiameter)`);
+    const pad = {
+      num: p[0].trim(),
+      x: Number(p[1]), y: Number(p[2]),
+      width: Number(p[3]), height: Number(p[4])
+    };
+    if (p.length === 6) {
+      pad.hole = Number(p[5]);
+      if (!Number.isFinite(pad.hole) || pad.hole <= 0) die(`bad hole diameter "${p[5]}" in pad spec "${s}" (want a positive mil number)`);
+      if (pad.hole > Math.min(pad.width, pad.height)) {
+        die(`pad ${pad.num}: drill ${pad.hole} larger than the copper ${pad.width}x${pad.height}`);
+      }
+    }
+    if (![pad.x, pad.y, pad.width, pad.height].every(Number.isFinite)) die(`bad numeric pad spec "${s}"`);
+    return pad;
+  });
+}
+
+// POLY path encoding of the example: [x0,y0,"L",x1,y1,x2,y2,...].
+function parseSilk(spec) {
+  return spec.split(';').map((s) => s.trim()).filter(Boolean).map((s) => {
+    const kind = s.split(',')[0].trim();
+    if (kind === 'rect') {
+      const pts = s.split(',').slice(1).map(Number);
+      if (pts.length !== 4 || pts.some((v) => Number.isNaN(v))) die(`bad silk rect "${s}"`);
+      const [x1, y1, x2, y2] = pts;
+      return { path: [x1, y1, 'L', x2, y1, x2, y2, x1, y2, x1, y1] };
+    }
+    if (kind === 'path') {
+      const pts = s.split(',').slice(1).map(Number);
+      if (pts.length < 4 || pts.length % 2 || pts.some((v) => Number.isNaN(v))) {
+        die(`bad silk path "${s}"`);
+      }
+      const path = [pts[0], pts[1], 'L'];
+      for (let i = 2; i < pts.length; i += 2) path.push(pts[i], pts[i + 1]);
+      return { path };
+    }
+    return die(`bad silk item "${s}" (want rect,... or path,...)`);
+  });
+}
+
+function parseOutline(spec) {
+  if (!spec) return undefined;
+  const p = spec.split(',').map((v) => v.trim());
+  if (p[0] !== 'R' || p.length !== 5) return die('outline must be R,x,y,w,h');
+  const [x, y, w, h] = [Number(p[1]), Number(p[2]), Number(p[3]), Number(p[4])];
+  // Emit explicit corners: real footprint docs describe outlines as polylines,
+  // never as rect paths (whose ["R",...] anchor convention differs).
+  return [x, y, 'L', x + w, y, x + w, y + h, x, y + h, x, y];
+}
+
+// Footprint/Designator attr ids and zIndexes; the PCB component block reuses
+// both (attr record id = compId + elem id, zIndex copied from the doc).
+function readAttrMeta(lines) {
+  const found = {};
+  for (const l of lines) {
+    const r = E.parseRecord(l);
+    if (r && r.type === 'ATTR' && r.body && (r.body.key === 'Footprint' || r.body.key === 'Designator')) {
+      found[r.body.key] = { id: r.id, zIndex: r.body.zIndex };
+    }
+  }
+  if (!found.Footprint || !found.Designator) die('generated footprint doc lacks Footprint/Designator attrs');
+  return found;
+}
+
+function main() {
+  const argv = process.argv.slice(2);
+  const cmd = argv[0];
+  if (!cmd || cmd === '-h' || cmd === '--help') {
+    printHelp('generate-footprint.js from-pads [options]', SCHEMA,
+      'Generate a footprint and stage it as <project>/.tmp/library/footprint/<name>.json.');
+    return;
+  }
+  if (cmd !== 'from-pads') die(`unknown subcommand "${cmd}" (want: from-pads)`);
+  const { opts } = parseArgs(argv.slice(1), SCHEMA);
+  const project = E.Project.load(opts.dir);
+  if (project.presetHas(opts.name)) {
+    die(`entry name "${opts.name}" shadows a preset template; pick another name (placement resolves presets first)`);
+  }
+
+  const title = opts.name;
+  const designator = opts.designator ? `${opts.designator}?` : 'U?';
+  const uuid = E.uuid16();
+  const { lines, pads } = E.buildFootprintDoc({
+    uuid,
+    client: project.client,
+    title,
+    description: opts.description || '',
+    tags: opts.tags ? opts.tags.split(',').map((t) => t.trim()).filter(Boolean) : [],
+    source: E.makeSource(E.uuid32(), project.index.owner_uuid),
+    ms: project.ms(),
+    outline: parseOutline(opts.outline),
+    silks: opts.silk ? parseSilk(opts.silk) : [],
+    pads: parsePads(opts.pads),
+    designator
+  });
+  const attrMeta = readAttrMeta(lines);
+
+  project.saveLibrary({
+    name: opts.name,
+    kind: 'footprint',
+    title,
+    footprintUuid: uuid,
+    designator,
+    description: opts.description || '',
+    footprintDoc: lines,
+    footprintElems: {
+      pads,
+      attrFootprint: attrMeta.Footprint.id,
+      attrDesignator: attrMeta.Designator.id
+    },
+    attrZ: { footprint: attrMeta.Footprint.zIndex, designator: attrMeta.Designator.zIndex }
+  });
+  console.log(`staged footprint "${opts.name}" (${lines.length} doc lines, ${pads.length} pads) -> .tmp/library/footprint/${opts.name}.json`);
+  console.log(`next: node scripts/add-footprint.js --dir ${opts.dir} --pcb <pcb> --symbol <sym> --footprint ${opts.name} --x <x> --y <y>`);
+}
+
+main();
